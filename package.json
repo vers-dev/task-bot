@@ -2,7 +2,7 @@
   "name": "task-bot",
   "version": "0.1.0",
   "private": true,
-  "description": "Telegram bot for creating/commenting/completing Trello cards",
+  "description": "Telegram bot for creating/commenting/completing tasks in Trello or YouGile",
   "engines": {
     "node": ">=20"
   },
@@ -10,9 +10,13 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "tsx --test tests/*.test.ts",
     "smoke": "tsx scripts/smoke.ts",
-    "trello:init": "tsx scripts/trello-init.ts"
+    "init": "tsx scripts/board-init.ts",
+    "trello:init": "tsx scripts/board-init.ts",
+    "yougile:init": "tsx scripts/board-init.ts",
+    "yougile:auth": "tsx scripts/yougile-auth.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

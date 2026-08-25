@@ -1,8 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import { webhookCallback } from 'grammy'
 import { loadConfig } from './config.js'
-import { TrelloClient } from './trello/client.js'
-import { getMe, resolveBoardRefs } from './trello/cards.js'
+import { createTracker } from './tracker/factory.js'
 import { createBot } from './bot.js'
 import { Store } from './store.js'
 
@@ -12,20 +11,17 @@ async function main(): Promise<void> {
   console.log(`[bot] instance: ${cfg.botInstance} (pid ${process.pid})`)
   console.log(`[bot] build: ${process.env.BUILD_SHA ?? 'dev'}`)
 
-  const client = new TrelloClient({
-    apiKey: cfg.trelloApiKey,
-    token: cfg.trelloToken,
-    proxyUrl: cfg.trelloProxy,
-  })
-  const me = await getMe(client)
-  console.log(`[trello] authenticated as @${me.username} (${me.fullName})`)
-  const refs = await resolveBoardRefs(client, cfg)
-  console.log(`[trello] board ${cfg.trelloBoardId} resolved ✅ (lists/fields/label OK)`)
+  const tracker = createTracker(cfg)
+  await tracker.start()
+  console.log(`[${tracker.kind}] connected ✅ ${tracker.describe()}`)
+  // Board schemas resolve lazily, per board — a chat picks its project itself.
+  const boards = await tracker.listBoards()
+  console.log(`[${tracker.kind}] доступно досок: ${boards.length}`)
 
   const store = new Store(cfg.dbPath)
   console.log(`[db] sqlite at ${cfg.dbPath}`)
 
-  const bot = createBot(cfg, client, refs, store)
+  const bot = createBot(cfg, tracker, store)
 
   let server: Server | undefined
 

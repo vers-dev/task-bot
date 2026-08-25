@@ -1,27 +1,15 @@
 /**
- * Smoke test: verify the Trello connection + core operations (incl. attachment,
- * creator-in-description, approval labels, comment, move) against YOUR board
- * before wiring up Telegram.
+ * Smoke test: verify the ACTIVE tracker (TRACKER=trello|yougile) end to end —
+ * create, attach a file, mark as an offer, approve, comment, re-read, close.
  *
- *   npm run smoke
+ *   npm run smoke            # first board the token sees
+ *   npm run smoke "Разраб"   # board whose name contains that substring
  *
- * It authenticates, resolves the board schema, creates a throwaway card with a
- * tiny PNG attachment and a creator line, marks it as an offer + approves it,
- * comments, re-reads it, then archives the test card.
+ * Everything runs against a REAL board and leaves one closed task behind
+ * («Smoke test task (safe to delete)»).
  */
-import { loadTrelloConfig } from '../src/config.js'
-import { TrelloClient } from '../src/trello/client.js'
-import {
-  addComment,
-  approveOffer,
-  attachFile,
-  createCard,
-  getCard,
-  listActiveCards,
-  markOffer,
-  resolveBoardRefs,
-  withCreator,
-} from '../src/trello/cards.js'
+import { loadTrackerConfig } from '../src/config.js'
+import { createTracker } from '../src/tracker/factory.js'
 import type { DownloadedFile } from '../src/telegram/media.js'
 
 // 1×1 transparent PNG.
@@ -37,56 +25,72 @@ const sampleFile = (name: string): DownloadedFile => ({
 })
 
 async function main(): Promise<void> {
-  const cfg = loadTrelloConfig()
-  const client = new TrelloClient({
-    apiKey: cfg.trelloApiKey,
-    token: cfg.trelloToken,
-    proxyUrl: cfg.trelloProxy,
+  const cfg = loadTrackerConfig()
+  const tracker = createTracker(cfg)
+  await tracker.start()
+  console.log(`✅ ${tracker.describe()}`)
+
+  const needle = process.argv[2]?.trim().toLowerCase()
+  const boards = await tracker.listBoards()
+  const board = needle ? boards.find((b) => b.name.toLowerCase().includes(needle)) : boards[0]
+  if (!board) throw new Error('Не нашёл доску для теста — проверь список: npm run init')
+
+  const missing = await tracker.checkBoard(board.id)
+  if (missing.length > 0) {
+    throw new Error(`Доска «${board.name}» не готова: ${missing.join('; ')}. Запусти: npm run init "${board.name}"`)
+  }
+  console.log(`✅ доска «${board.name}» готова\n`)
+
+  console.log('Создаю тестовую задачу-предложение (создатель + вложение)…')
+  const task = await tracker.createTask({
+    boardId: board.id,
+    title: 'Smoke test task (safe to delete)',
+    description: 'Created by the smoke test of task-bot.',
+    creator: '@smoke-test',
+    offer: true,
   })
+  await tracker.attach(task, [sampleFile('smoke.png')], 'Вложение из smoke-теста')
+  console.log(`✅ создана ${task.num || task.id}`)
 
-  const me = await client.get<{ username: string; fullName: string }>('/members/me', {
-    fields: 'username,fullName',
-  })
-  console.log(`✅ authenticated as @${me.username} (${me.fullName})`)
+  console.log('\nОдобряю предложение…')
+  await tracker.approveOffer(task)
+  console.log('✅ одобрено')
 
-  const refs = await resolveBoardRefs(client, cfg)
-  console.log(`✅ board schema resolved (todo=${refs.listTodo}, done=${refs.listDone})\n`)
+  console.log('\nДобавляю комментарий…')
+  await tracker.comment(task, 'Smoke test comment 👋')
+  console.log('✅ комментарий добавлен')
 
-  console.log('Creating test card (creator line + attachment)…')
-  const created = await createCard(
-    client,
-    refs.listTodo,
-    'Smoke test card (safe to delete)',
-    withCreator('Created by the smoke test of task-bot.', '@smoke-test'),
+  console.log('\nПеречитываю задачу…')
+  const fresh = await tracker.getTask(task.ref)
+  if (!fresh) throw new Error('getTask вернул undefined для только что созданной задачи')
+  console.log(
+    `✅ creator="${fresh.creatorText}", approval=${fresh.approval}, attachments=${fresh.attachments ?? 'n/a'}`,
   )
-  await attachFile(client, created.id, sampleFile('smoke.png'))
-  console.log(`✅ created #${created.idShort} (${created.shortLink})`)
+  if (fresh.creatorText !== '@smoke-test') throw new Error(`creator mismatch: ${fresh.creatorText}`)
+  if (fresh.approval !== 'approved') throw new Error(`approval mismatch: ${fresh.approval}`)
 
-  console.log('\nMarking as offer, then approving…')
-  await markOffer(client, refs, created.id)
-  await approveOffer(client, refs, created.id)
-  console.log('✅ labels applied')
+  console.log('\nСписок активных задач (sanity)…')
+  const active = await tracker.listActive(board.id, 5)
+  console.log(`✅ listActive вернул ${active.length} задач(и)`)
 
-  console.log('\nAdding a comment…')
-  await addComment(client, created.id, 'Smoke test comment 👋')
-  console.log('✅ commented')
+  console.log('\nНазначаю исполнителя…')
+  const members = await tracker.listMembers(board.id, 5)
+  if (members.length === 0) {
+    console.log('⚠️  участников на доске нет — пропускаю')
+  } else {
+    await tracker.setAssignee(fresh, members[0].ref)
+    const assigned = await tracker.getTask(task.ref)
+    console.log(`✅ исполнитель: ${assigned?.assigneeName}`)
+    if (assigned?.assigneeName === '—') throw new Error('исполнитель не назначился')
+  }
 
-  console.log('\nRe-reading the card…')
-  const d = await getCard(client, refs, created.shortLink)
-  if (!d) throw new Error('getCard returned undefined for the just-created card')
-  console.log(`✅ card: creator="${d.creatorText}", approval=${d.approval}, attachments=${d.attachments}`)
-  if (d.creatorText !== '@smoke-test') throw new Error(`creator mismatch: ${d.creatorText}`)
-  if (d.approval !== 'approved') throw new Error(`approval mismatch: ${d.approval}`)
+  console.log('\nЗакрываю тестовую задачу…')
+  await tracker.complete(fresh)
+  const closed = await tracker.getTask(task.ref)
+  if (!closed?.done) throw new Error('задача не перешла в «выполнено»')
+  console.log('✅ закрыта')
 
-  console.log('\nListing active cards (sanity)…')
-  const active = await listActiveCards(client, refs, 5)
-  console.log(`✅ listActiveCards returned ${active.length} card(s)`)
-
-  console.log('\nArchiving the test card…')
-  await client.put(`/cards/${created.id}`, { closed: 'true' })
-  console.log('✅ archived')
-
-  console.log('\n🎉 All Trello operations succeeded.')
+  console.log(`\n🎉 Все операции ${tracker.kind} прошли успешно.`)
 }
 
 main().catch((err) => {
