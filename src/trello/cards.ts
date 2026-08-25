@@ -1,5 +1,5 @@
 import type { TrelloClient } from './client.js'
-import type { TrelloConfig } from '../config.js'
+import type { StatusNames } from '../tracker/types.js'
 import type { DownloadedFile } from '../telegram/media.js'
 
 // ── Light shapes of the Trello objects we touch (the API returns much more) ──
@@ -11,18 +11,19 @@ interface TLabel {
   id: string
   name: string
 }
-interface TMember {
+export interface TMember {
   id: string
   fullName: string
   username: string
 }
-interface TCard {
+export interface TCard {
   id: string
   shortLink: string
   idShort: number
   name: string
   url: string
   idList: string
+  idBoard: string
   desc?: string
   idMembers?: string[]
   idLabels?: string[]
@@ -30,90 +31,185 @@ interface TCard {
   badges?: { attachments?: number }
   members?: TMember[]
 }
-
-/**
- * Approval state of an /offer card. Custom Fields are paywalled on Trello's free
- * plan, so approval is modelled with FREE primitives instead:
- *   - pending  → has the «Предложение» label, still in an active list
- *   - approved → also has the «Одобрено» label (stays active)
- *   - rejected → «Предложение» label + moved to the «Отменено» list
- */
-export type Approval = 'pending' | 'approved' | 'rejected'
-
-// The "Создатель" line appended to a card's description (Custom Fields are paid).
-const CREATOR_MARKER = '— Создатель:'
-const CREATOR_RE = /^—\s*Создатель:\s*(.+?)\s*$/m
-
-/** Append the creator tag to a description (Telegram @username of the author). */
-export function withCreator(desc: string, tag: string): string {
-  const base = (desc ?? '').trim()
-  return base ? `${base}\n\n${CREATOR_MARKER} ${tag}` : `${CREATOR_MARKER} ${tag}`
+export interface TBoard {
+  id: string
+  name: string
+  closed?: boolean
+  idOrganization?: string
 }
 
-/** Extract the creator tag from a description, or "—" if absent. */
-function parseCreator(desc: string | undefined): string {
-  const m = desc?.match(CREATOR_RE)
-  return m ? m[1].trim() : '—'
+/** Everything the bot resolves by name on a board. */
+export interface TrelloNames {
+  status: StatusNames
+  /** Label marking a card as an /offer (== approval "pending"). */
+  offerLabel: string
+  /** Label marking an /offer as approved. */
+  approvedLabel: string
 }
 
 /**
- * Resolved board metadata: names from config → concrete Trello ids. Resolved once
- * at startup (mirrors how the old Huly code resolved statuses/attributes by name),
- * so the rest of the code works with ids and never re-queries the board schema.
+ * Resolved board metadata: names from config → concrete Trello ids. Resolved
+ * lazily per board (the bot can post to any board the token sees) and cached by
+ * the tracker, so the rest of the code works with ids and never re-queries the
+ * board schema.
  */
 export interface BoardRefs {
   boardId: string
   listTodo: string
   listDone: string
   listCancelled: string
-  /** Label marking a card as an /offer (== approval "pending"). */
   offerLabelId: string
-  /** Label marking an /offer as approved. */
   approvedLabelId: string
 }
 
-/**
- * Resolve list/label ids on the board by their configured names. Throws a single
- * actionable error listing everything missing (→ run trello:init).
- */
-export async function resolveBoardRefs(client: TrelloClient, cfg: TrelloConfig): Promise<BoardRefs> {
-  // The configured id may be a shortLink (from the board URL). GET endpoints accept it,
-  // but write ops (idBoard/idMember) need the canonical 24-char id → resolve it once.
-  const [board, lists, labels] = await Promise.all([
-    client.get<{ id: string }>(`/boards/${cfg.trelloBoardId}`, { fields: 'id' }),
-    client.get<TList[]>(`/boards/${cfg.trelloBoardId}/lists`, { fields: 'name', filter: 'open' }),
-    client.get<TLabel[]>(`/boards/${cfg.trelloBoardId}/labels`, { fields: 'name', limit: 1000 }),
-  ])
+const eq = (a: string, b: string): boolean => a.trim() === b.trim()
 
+interface BoardSchema {
+  boardId: string
+  lists: TList[]
+  labels: TLabel[]
+}
+
+/**
+ * Read a board's lists and labels in one go. The configured id may be a
+ * shortLink (from the board URL) — GET endpoints accept it, but write ops
+ * (idBoard/idMember) need the canonical 24-char id, so it is resolved here too.
+ */
+async function fetchSchema(client: TrelloClient, boardId: string): Promise<BoardSchema> {
+  const [board, lists, labels] = await Promise.all([
+    client.get<{ id: string }>(`/boards/${boardId}`, { fields: 'id' }),
+    client.get<TList[]>(`/boards/${boardId}/lists`, { fields: 'name', filter: 'open' }),
+    client.get<TLabel[]>(`/boards/${boardId}/labels`, { fields: 'name', limit: 1000 }),
+  ])
+  return { boardId: board.id, lists, labels }
+}
+
+/** Match the configured names against a board's schema. */
+function pickRefs(schema: BoardSchema, names: TrelloNames): { refs: BoardRefs; missing: string[] } {
   const missing: string[] = []
-  const eq = (a: string, b: string): boolean => a.trim() === b.trim()
 
   const findList = (name: string): string => {
-    const l = lists.find((x) => eq(x.name, name))
+    const l = schema.lists.find((x) => eq(x.name, name))
     if (!l) missing.push(`колонка «${name}»`)
     return l?.id ?? ''
   }
   const findLabel = (name: string): string => {
-    const l = labels.find((x) => eq(x.name, name))
+    const l = schema.labels.find((x) => eq(x.name, name))
     if (!l) missing.push(`метка «${name}»`)
     return l?.id ?? ''
   }
 
   const refs: BoardRefs = {
-    boardId: board.id,
-    listTodo: findList(cfg.listTodoName),
-    listDone: findList(cfg.listDoneName),
-    listCancelled: findList(cfg.listCancelledName),
-    offerLabelId: findLabel(cfg.offerLabelName),
-    approvedLabelId: findLabel(cfg.approvedLabelName),
+    boardId: schema.boardId,
+    listTodo: findList(names.status.todo),
+    listDone: findList(names.status.done),
+    listCancelled: findList(names.status.cancelled),
+    offerLabelId: findLabel(names.offerLabel),
+    approvedLabelId: findLabel(names.approvedLabel),
   }
+  return { refs, missing }
+}
 
+/** Resolve list/label ids on a board. Throws one actionable error if anything is missing. */
+export async function resolveBoardRefs(
+  client: TrelloClient,
+  boardId: string,
+  names: TrelloNames,
+): Promise<BoardRefs> {
+  const { refs, missing } = pickRefs(await fetchSchema(client, boardId), names)
   if (missing.length > 0) {
-    throw new Error(
-      `На доске не хватает: ${missing.join('; ')}. Запусти «npm run trello:init» — он создаст недостающее.`,
-    )
+    throw new Error(`На доске не хватает: ${missing.join('; ')}.`)
   }
   return refs
+}
+
+/** What the board is missing; empty array means it is ready to use. */
+export async function missingBoardParts(
+  client: TrelloClient,
+  boardId: string,
+  names: TrelloNames,
+): Promise<string[]> {
+  return pickRefs(await fetchSchema(client, boardId), names).missing
+}
+
+/** Category labels get distinct colours, cycled. */
+const CATEGORY_COLORS = ['blue', 'sky', 'lime', 'orange', 'red', 'pink', 'black']
+
+/**
+ * Idempotently create everything the bot resolves by name: three lists and the
+ * two approval labels (plus optional category labels). Safe to re-run.
+ * Reports what it created, so the CLI scaffolder can just print the lines.
+ */
+export async function setupBoard(
+  client: TrelloClient,
+  boardId: string,
+  names: TrelloNames,
+  categoryLabels: string[] = [],
+): Promise<string[]> {
+  const schema = await fetchSchema(client, boardId)
+  const log: string[] = []
+
+  const ensureList = async (name: string): Promise<void> => {
+    const found = schema.lists.find((l) => eq(l.name, name))
+    if (found) {
+      log.push(`  ✓ колонка «${name}» уже есть (${found.id})`)
+      return
+    }
+    const created = await client.post<TList>('/lists', undefined, {
+      name,
+      idBoard: schema.boardId,
+      pos: 'bottom',
+    })
+    schema.lists.push(created)
+    log.push(`  + создана колонка «${name}» (${created.id})`)
+  }
+
+  const ensureLabel = async (name: string, color: string): Promise<void> => {
+    const found = schema.labels.find((l) => eq(l.name, name))
+    if (found) {
+      log.push(`  ✓ метка «${name}» уже есть (${found.id})`)
+      return
+    }
+    const created = await client.post<TLabel>('/labels', undefined, {
+      name,
+      color,
+      idBoard: schema.boardId,
+    })
+    schema.labels.push(created)
+    log.push(`  + создана метка «${name}» (${created.id})`)
+  }
+
+  await ensureList(names.status.todo)
+  await ensureList(names.status.done)
+  await ensureList(names.status.cancelled)
+  await ensureLabel(names.offerLabel, 'purple')
+  await ensureLabel(names.approvedLabel, 'green')
+  for (let i = 0; i < categoryLabels.length; i++) {
+    await ensureLabel(categoryLabels[i], CATEGORY_COLORS[i % CATEGORY_COLORS.length])
+  }
+
+  return log
+}
+
+/** Open boards visible to the token, plus the workspace names to group them by. */
+export async function listBoards(
+  client: TrelloClient,
+): Promise<{ boards: TBoard[]; orgs: Map<string, string> }> {
+  const [boards, orgs] = await Promise.all([
+    client.get<TBoard[]>('/members/me/boards', {
+      fields: 'name,closed,idOrganization',
+      filter: 'open',
+    }),
+    client
+      .get<{ id: string; displayName: string }[]>('/members/me/organizations', {
+        fields: 'displayName',
+      })
+      .catch(() => []),
+  ])
+  return {
+    boards: boards.filter((b) => !b.closed),
+    orgs: new Map(orgs.map((o) => [o.id, o.displayName])),
+  }
 }
 
 /** Authenticated Trello account (for the startup health line). */
@@ -186,109 +282,49 @@ export async function attachFile(
   await client.postForm(`/cards/${cardId}/attachments`, form)
 }
 
-export interface MemberInfo {
-  id: string
-  name: string
-}
-
 /** Board members that can be set as a card's assignee. */
 export async function listMembers(
   client: TrelloClient,
-  refs: BoardRefs,
+  boardId: string,
   limit = 30,
-): Promise<MemberInfo[]> {
-  const members = await client.get<TMember[]>(`/boards/${refs.boardId}/members`, {
+): Promise<TMember[]> {
+  const members = await client.get<TMember[]>(`/boards/${boardId}/members`, {
     fields: 'fullName,username',
   })
-  return members
-    .map((m) => ({ id: m.id, name: (m.fullName || `@${m.username}`).trim() }))
-    .filter((m) => m.name.length > 0)
-    .slice(0, limit)
+  return members.slice(0, limit)
 }
 
-export interface CardBrief {
-  shortLink: string
-  idShort: number
-  name: string
-}
-
-/** Active cards (the "Задачи" list), most-recently-active first. For /comment and /complete. */
+/** Cards in a list, most-recently-active first. For /comment and /complete. */
 export async function listActiveCards(
   client: TrelloClient,
-  refs: BoardRefs,
+  listId: string,
   limit = 20,
-): Promise<CardBrief[]> {
-  const cards = await client.get<TCard[]>(`/lists/${refs.listTodo}/cards`, {
+): Promise<TCard[]> {
+  const cards = await client.get<TCard[]>(`/lists/${listId}/cards`, {
     fields: 'name,idShort,shortLink,dateLastActivity',
   })
   return cards
     .sort((a, b) => (b.dateLastActivity ?? '').localeCompare(a.dateLastActivity ?? ''))
     .slice(0, limit)
-    .map((c) => ({ shortLink: c.shortLink, idShort: c.idShort, name: c.name }))
-}
-
-export interface CardData {
-  id: string
-  shortLink: string
-  idShort: number
-  name: string
-  url: string
-  idList: string
-  /** Joined display names of card members, or "—". */
-  assigneeName: string
-  /** Creator (Telegram @username) parsed from the description, or "—". */
-  creatorText: string
-  approval: Approval | null
-  attachments: number
-  done: boolean
-  cancelled: boolean
 }
 
 /**
- * Re-read everything needed to render a card straight from Trello (by shortLink).
- * Keeps the card buttons STATELESS — any bot instance can handle a click and cards
- * survive restarts (the shortLink lives in the callback data, all state in Trello).
+ * Read a card by shortLink, with the fields needed to render it. Returns
+ * undefined for a deleted/unknown card. `idBoard` comes back too — the tracker
+ * needs it to resolve which board's lists and labels this card belongs to.
  */
-export async function getCard(
+export async function fetchCard(
   client: TrelloClient,
-  refs: BoardRefs,
   shortLink: string,
-): Promise<CardData | undefined> {
-  let card: TCard
+): Promise<TCard | undefined> {
   try {
-    card = await client.get<TCard>(`/cards/${shortLink}`, {
-      fields: 'name,idShort,shortLink,url,idList,idMembers,idLabels,desc,badges',
+    return await client.get<TCard>(`/cards/${shortLink}`, {
+      fields: 'name,idShort,shortLink,url,idList,idBoard,idMembers,idLabels,desc,badges',
       members: 'true',
       member_fields: 'fullName,username',
     })
   } catch (err) {
     if (err instanceof Error && /HTTP 404/.test(err.message)) return undefined
     throw err
-  }
-
-  const members = card.members ?? []
-  const assigneeName = members.length
-    ? members.map((m) => (m.fullName || `@${m.username}`).trim()).join(', ')
-    : '—'
-
-  const labels = card.idLabels ?? []
-  const cancelled = card.idList === refs.listCancelled
-  let approval: Approval | null = null
-  if (labels.includes(refs.approvedLabelId)) approval = 'approved'
-  else if (labels.includes(refs.offerLabelId)) approval = cancelled ? 'rejected' : 'pending'
-
-  return {
-    id: card.id,
-    shortLink: card.shortLink,
-    idShort: card.idShort,
-    name: card.name,
-    url: card.url,
-    idList: card.idList,
-    assigneeName,
-    creatorText: parseCreator(card.desc),
-    approval,
-    attachments: card.badges?.attachments ?? 0,
-    done: card.idList === refs.listDone,
-    cancelled,
   }
 }

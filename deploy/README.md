@@ -73,11 +73,21 @@ TELEGRAM_BOT_TOKEN=...
 ALLOWED_CHAT_IDS=
 PIN_ISSUES=true
 OFFER_APPROVERS=...
+TRACKER=trello
 TRELLO_API_KEY=...
 TRELLO_TOKEN=...
-TRELLO_BOARD_ID=a1B2c3D4
+TRELLO_BOARD_ID=a1B2c3D4      # опционально: закрепить бота за одной доской
 ```
-(имена колонок/полей/метки берутся из дефолтов — переопределяй `TRELLO_LIST_*` / `TRELLO_FIELD_*` / `TRELLO_LABEL_OFFER` только если на доске они названы иначе. Перед первым запуском на новой доске — `npm run trello:init`.)
+
+Для YouGile вместо трёх последних строк:
+```
+TRACKER=yougile
+YOUGILE_BASE_URL=https://ru.yougile.com
+YOUGILE_TOKEN=...
+YOUGILE_TASK_URL=https://ru.yougile.com/.../{id}
+```
+
+(имена колонок берутся из дефолтов — переопределяй `LIST_TODO` / `LIST_DONE` / `LIST_CANCELLED` и `TRELLO_LABEL_OFFER` только если на доске они названы иначе. Перед первым запуском на новой доске — `npm run init "<имя доски>"`, либо кнопка «➕ Создать» прямо в чате.)
 
 ```bash
 sudo chmod 600 /var/www/task-bot/.env
