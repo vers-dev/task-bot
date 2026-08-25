@@ -1,0 +1,27 @@
+# Серверный compose для прода → /var/www/task-bot/docker-compose.yml
+#
+# КЛЮЧЕВОЕ: image: ${IMAGE}, НЕ build. deploy.sh скачивает образ из registry и
+# прокидывает его тег через переменную IMAGE — здесь он и подхватывается. Если
+# поставить build: / фиксированный image — deploy.sh скачает образ впустую, а
+# контейнер поднимется из старого локального билда (именно это и ловили в логе).
+#
+# Один контейнер (не blue-green): Telegram — один getUpdates, в webhook — один
+# routed-слот. Деплой = recreate (см. блок task-bot в /usr/local/bin/deploy.sh).
+services:
+  bot:
+    image: ${IMAGE:-git.example.com/acme/task-bot:latest}
+    container_name: task_bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/bot.db
+    ports:
+      # Нужен для webhook (nginx с хоста → 127.0.0.1:8090 → бот).
+      # Для чистого polling порт можно убрать.
+      - "127.0.0.1:8090:8090"
+    volumes:
+      # SQLite (отложенные /comment) переживает редеплой за счёт именованного volume.
+      - bot-data:/app/data
+
+volumes:
+  bot-data:

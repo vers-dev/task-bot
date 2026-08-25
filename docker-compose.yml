@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    image: task-bot:latest
+    container_name: task-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/bot.db
+    volumes:
+      - bot-data:/app/data
+    # Long-polling Telegram bot: only outbound traffic (api.telegram.org + api.trello.com),
+    # no inbound ports needed.
+
+volumes:
+  bot-data:

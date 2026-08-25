@@ -1,0 +1,50 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+
+# Образ собирается и пушится в registry git.example.com, deploy.sh на проде тянет его.
+# Registry за Cloudflare иногда отдаёт 525 — deploy.sh ретраит pull до 5 раз, этого хватает.
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    if: gitea.event_name == 'push' && gitea.ref == 'refs/heads/main'
+    steps:
+      - name: "GIT > Checkout"
+        uses: https://github.com/actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: "Docker > Setup Build"
+        uses: https://github.com/docker/setup-buildx-action@v3
+
+      - name: "Docker > Login action"
+        uses: https://github.com/docker/login-action@v3
+        with:
+          registry: git.example.com
+          username: ci
+          password: ${{ secrets.CI_TOKEN }}
+
+      - name: "Docker > Push Image"
+        uses: https://github.com/docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            BUILD_SHA=${{ gitea.sha }}
+          tags: |
+            git.example.com/acme/task-bot:latest
+            git.example.com/acme/task-bot:${{ gitea.sha }}
+
+      - name: "Deploy > Production"
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo deploy.sh task-bot git.example.com/acme/task-bot:${{ gitea.sha }}"
